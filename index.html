@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Attendance Tracker — Lawrenceville Summer Scholars 2026</title>
-<link rel="icon" href="https://summerscholars.lawrenceville.org/favicon.ico" type="image/x-icon">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -51,10 +50,6 @@ const REFRESH_INTERVAL_MS=20000;
 // ============================================================
 // TEACHER ROSTER — Updated June 2026
 // ============================================================
-// Each teacher has: name, room, periods (true/false), course per period.
-// If a teacher has different rooms per period, use roomByPeriod instead of room.
-// The getRoom(teacher, period) helper resolves the correct room.
-// ============================================================
 const TEACHERS=[
 {name:"Jonathan Marrow",room:"Pop 133",periods:{1:false,2:true,3:true,4:true},course:{2:"Humanities 2E: Literature and Composition (8-9)",3:"The Rise and Fall of Civilizations (6-7)",4:"The Rise and Fall of Civilizations (8-9)"}},
 {name:"Emmett Gallagher",room:"Pop 124",periods:{1:true,2:true,3:false,4:true},course:{1:"Humanities 1B: Mystery and Suspense (6-7)",2:"Humanities 2A: Mystery and Suspense (6-7)",4:"Humanities 4B: Mystery and Suspense (6-7)"}},
@@ -91,18 +86,19 @@ const TEACHERS=[
 {name:"Jerome Keeler",room:"KMSC 213",periods:{1:true,2:true,3:true,4:false},course:{1:"SSAT Verbal and Reading (8-9)",2:"SSAT Verbal and Reading (6-7)",3:"SSAT Verbal and Reading (8-9)"}},
 ];
 
-// ============================================================
-// Helper: resolve room for a teacher in a given period
-// ============================================================
 function getRoom(teacher, period) {
-  if (teacher.roomByPeriod && teacher.roomByPeriod[period]) {
-    return teacher.roomByPeriod[period];
-  }
+  if (teacher.roomByPeriod && teacher.roomByPeriod[period]) return teacher.roomByPeriod[period];
   return teacher.room || "";
 }
 
+// ============================================================
+// STATE + DATA CACHE
+// ============================================================
+var dataCache = {}; // keyed by date string, stores {1:{},2:{},3:{},4:{}}
+
 let state={selectedDate:getTodayStr(),activePeriod:1,allSubmissions:{1:{},2:{},3:{},4:{}},manualOverrides:{},isLive:true,filterMode:"all",lastFetchError:null,soundEnabled:false,previousMissingCount:null,healthLeave:[],dailySick:[],listsVisible:true};
 let refreshTimer=null,graceTimer=null;
+var lastDateBarSelection = null; // track which date button is selected to avoid full re-render
 
 function isPractice(){return state.selectedDate===PRACTICE_DATE}
 function isToday(){return state.selectedDate===getTodayStr()}
@@ -124,42 +120,53 @@ function startGraceTimer(){if(graceTimer)clearInterval(graceTimer);graceTimer=se
 function filterAbsentees(raw){if(!raw)return{display:"",hasSickStudents:false};var lower=raw.toLowerCase().trim();if(lower==="none"||lower==="none."||lower==="n/a"||lower==="")return{display:"",hasSickStudents:false};var names=raw.split(/,|(?:\band\b)/i).map(function(n){return n.trim()}).filter(Boolean);var hlLC=state.healthLeave.map(function(n){return n.toLowerCase().trim()});var dsLC=state.dailySick.map(function(n){return n.toLowerCase().trim()});var kept=[],hasSick=false;names.forEach(function(name){var nLC=name.toLowerCase().trim();if(hlLC.some(function(h){return nLC.indexOf(h)!==-1||h.indexOf(nLC)!==-1}))return;if(dsLC.some(function(s){return nLC.indexOf(s)!==-1||s.indexOf(nLC)!==-1}))hasSick=true;kept.push(name)});return{display:kept.join(", "),hasSickStudents:hasSick}}
 
 // ============================================================
-// DATA FETCHING
+// DATA FETCHING — with per-date caching
 // ============================================================
 async function fetchAllPeriods(){
   if(!APPS_SCRIPT_URL){useDemoData();return}
+
+  var dateParam=isPractice()?getTodayStr():state.selectedDate;
+  var cacheKey=isPractice()?"practice":state.selectedDate;
+  var isCurrent=isToday()||isPractice();
+
+  // For past dates that are already cached, use cache instantly — no network call
+  if(!isCurrent && dataCache[cacheKey]){
+    state.allSubmissions=dataCache[cacheKey];
+    state.lastFetchError=null;
+    renderContent();
+    return;
+  }
+
+  // For today/practice, show cached data immediately if available, then refresh in background
+  if(isCurrent && dataCache[cacheKey]){
+    state.allSubmissions=dataCache[cacheKey];
+    state.lastFetchError=null;
+    renderContent();
+  }
+
   try{
-    var dateParam=isPractice()?getTodayStr():state.selectedDate;
     var url=APPS_SCRIPT_URL+"?date="+dateParam;
     var r=await fetch(url);if(!r.ok)throw new Error("HTTP "+r.status);var data=await r.json();if(data.error)throw new Error(data.error);
     var bp={1:{},2:{},3:{},4:{}};(data.submissions||[]).forEach(function(s){var n=findMatch(s.teacherName);if(n&&s.period>=1&&s.period<=4)bp[s.period][n]=s});
-    if((isToday()||isPractice())&&state.soundEnabled){var act=TEACHERS.filter(function(t){return t.periods[state.activePeriod]});var old=state.previousMissingCount;var ns=act.filter(function(t){return bp[state.activePeriod][t.name]||state.manualOverrides[t.name]}).length;var nm=act.length-ns;if(old!==null&&nm===0&&old>0)playChime();state.previousMissingCount=nm}
-    state.allSubmissions=bp;state.lastFetchError=null;render()
-  }catch(err){state.lastFetchError=err.message;render()}
+    if(isCurrent&&state.soundEnabled){var act=TEACHERS.filter(function(t){return t.periods[state.activePeriod]});var old=state.previousMissingCount;var ns=act.filter(function(t){return bp[state.activePeriod][t.name]||state.manualOverrides[t.name]}).length;var nm=act.length-ns;if(old!==null&&nm===0&&old>0)playChime();state.previousMissingCount=nm}
+    dataCache[cacheKey]=bp;
+    state.allSubmissions=bp;state.lastFetchError=null;renderContent()
+  }catch(err){state.lastFetchError=err.message;renderContent()}
 }
 
-// ============================================================
-// NAME MATCHING — accent-insensitive, fuzzy last-name fallback
-// ============================================================
 function stripAccents(s){return s.normalize("NFD").replace(/[\u0300-\u036f]/g,"")}
 function findMatch(name){
   if(!name)return null;
-  var c=name.trim().toLowerCase();
-  var cStripped=stripAccents(c);
-  // Exact match (accent-insensitive)
-  for(var i=0;i<TEACHERS.length;i++){
-    if(stripAccents(TEACHERS[i].name.toLowerCase())===cStripped)return TEACHERS[i].name;
-  }
-  // Last-name match
+  var c=name.trim().toLowerCase();var cStripped=stripAccents(c);
+  for(var i=0;i<TEACHERS.length;i++){if(stripAccents(TEACHERS[i].name.toLowerCase())===cStripped)return TEACHERS[i].name}
   var ps=c.split(/\s+/);var last=stripAccents(ps[ps.length-1]);
   var ms=TEACHERS.filter(function(t){var tp=stripAccents(t.name.toLowerCase()).split(/\s+/);return tp[tp.length-1]===last});
   if(ms.length===1)return ms[0].name;
-  // First-initial + last-name match
   if(ps.length>=2){var firstPre=stripAccents(ps[0]).substring(0,3);for(var j=0;j<TEACHERS.length;j++){var tp=stripAccents(TEACHERS[j].name.toLowerCase()).split(/\s+/);if(tp[0].substring(0,3)===firstPre&&tp[tp.length-1]===last)return TEACHERS[j].name}}
   return null;
 }
 
-function useDemoData(){var bp={1:{},2:{},3:{},4:{}};[1,2,3,4].forEach(function(p){var act=TEACHERS.filter(function(t){return t.periods[p]});var sh=act.slice().sort(function(){return Math.random()-.5});var cnt=Math.floor(sh.length*.7);sh.slice(0,cnt).forEach(function(t){bp[p][t.name]={teacherName:t.name,course:t.course[p]||"",period:p,absentees:Math.random()>.75?"Sample Student A, Sample Student B":"None",timestamp:new Date().toISOString()}})});state.allSubmissions=bp;state.lastFetchError=null;var act=TEACHERS.filter(function(t){return t.periods[state.activePeriod]});state.previousMissingCount=act.length-act.filter(function(t){return bp[state.activePeriod][t.name]}).length;render()}
+function useDemoData(){var bp={1:{},2:{},3:{},4:{}};[1,2,3,4].forEach(function(p){var act=TEACHERS.filter(function(t){return t.periods[p]});var sh=act.slice().sort(function(){return Math.random()-.5});var cnt=Math.floor(sh.length*.7);sh.slice(0,cnt).forEach(function(t){bp[p][t.name]={teacherName:t.name,course:t.course[p]||"",period:p,absentees:Math.random()>.75?"Sample Student A, Sample Student B":"None",timestamp:new Date().toISOString()}})});state.allSubmissions=bp;state.lastFetchError=null;var act=TEACHERS.filter(function(t){return t.periods[state.activePeriod]});state.previousMissingCount=act.length-act.filter(function(t){return bp[state.activePeriod][t.name]}).length;renderContent()}
 
 function playChime(){try{var ctx=new(window.AudioContext||window.webkitAudioContext)();var o=ctx.createOscillator();var g=ctx.createGain();o.connect(g);g.connect(ctx.destination);o.frequency.value=880;o.type="sine";g.gain.setValueAtTime(.3,ctx.currentTime);g.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+.5);o.start(ctx.currentTime);o.stop(ctx.currentTime+.5)}catch(e){}}
 
@@ -167,23 +174,45 @@ function getBK(room){if(!room)return"kmsc";if(room.indexOf("Abbott")===0)return"
 function getLN(name){var p=name.split(" ");return p[p.length-1]}
 function esc(s){var d=document.createElement("div");d.textContent=s;return d.innerHTML}
 
-function renderDateBar(){
+// ============================================================
+// DATE BAR — built once, updated via class changes
+// ============================================================
+function buildDateBar(){
   var today=getTodayStr();var html="";
-  PROGRAM_WEEKS.forEach(function(wk){html+='<div class="date-week"><div class="date-week-label">'+wk.label+'</div><div class="date-week-btns">';wk.dates.forEach(function(d){var isT=d===today;var isS=d===state.selectedDate;var cls="date-btn";if(isT)cls+=" today";if(isS)cls+=" selected";html+='<button class="'+cls+'" onclick="selectDate(\''+d+'\')">'+fmtLabel(d)+'</button>'});html+='</div></div>'});
-  var pracCls="date-btn practice"+(isPractice()?" selected":"");
-  html+='<div class="date-week"><div class="date-week-label">Testing</div><div class="date-week-btns"><button class="'+pracCls+'" onclick="selectDate(\'practice\')">🧪 Practice / Testing</button></div></div>';
-  if(isPractice())html+='<div class="date-past-note practice-note">Testing mode — showing live data from your Google Sheet for today ('+fmtLabel(getTodayStr())+"). Submit test responses to your form and click Refresh to see them here.</div>";
-  else if(state.selectedDate!==today)html+='<div class="date-past-note hist">Viewing '+fmtLabel(state.selectedDate)+(state.selectedDate<today?' — historical data':' — upcoming, no submissions yet')+'</div>';
+  PROGRAM_WEEKS.forEach(function(wk){html+='<div class="date-week"><div class="date-week-label">'+wk.label+'</div><div class="date-week-btns">';wk.dates.forEach(function(d){var isT=d===today;var cls="date-btn";if(isT)cls+=" today";html+='<button class="'+cls+'" data-date="'+d+'" onclick="selectDate(\''+d+'\')">'+fmtLabel(d)+'</button>'});html+='</div></div>'});
+  html+='<div class="date-week"><div class="date-week-label">Testing</div><div class="date-week-btns"><button class="date-btn practice" data-date="practice" onclick="selectDate(\'practice\')">🧪 Practice / Testing</button></div></div>';
+  html+='<div class="date-past-note" id="date-note"></div>';
   document.getElementById("date-bar").innerHTML=html;
 }
 
-function renderStudentLists(){var c=document.getElementById("student-lists");if(!state.listsVisible){c.innerHTML='<button class="sl-toggle" onclick="state.listsVisible=true;render();">Show student health leave &amp; daily sick lists ▾</button>';return}var hlC=state.healthLeave.length>0?state.healthLeave.map(function(n,i){return'<span class="sl-chip health">'+esc(n)+' <span class="sl-chip-x" onclick="removeHL('+i+')">×</span></span>'}).join(""):'<span class="sl-empty">No students on health leave</span>';var dsC=state.dailySick.length>0?state.dailySick.map(function(n,i){return'<span class="sl-chip sick">'+esc(n)+' <span class="sl-chip-x" onclick="removeDS('+i+')">×</span></span>'}).join(""):'<span class="sl-empty">No students on today\'s sick list</span>';c.innerHTML='<div class="student-list-box health"><div class="sl-header"><span class="sl-title health">🏥 Health Leave</span><button class="sl-toggle" onclick="state.listsVisible=false;render();">Hide ▴</button></div><div class="sl-desc">Names <strong>suppressed</strong> from absent displays. Persists across days.</div><div class="sl-input-row"><input type="text" id="hl-input" placeholder="Student name…" onkeydown="if(event.key===\'Enter\')addHL()"><button class="sl-add-btn" onclick="addHL()">+ Add</button></div><div class="sl-chips">'+hlC+'</div></div><div class="student-list-box sick"><div class="sl-header"><span class="sl-title sick">🤒 Daily Sick List</span></div><div class="sl-desc">Reference only — names still show as absent, cards annotated. <strong>Persists until end of day</strong>, then auto-clears.</div><div class="sl-input-row"><input type="text" id="ds-input" placeholder="Student name…" onkeydown="if(event.key===\'Enter\')addDS()"><button class="sl-add-btn" onclick="addDS()">+ Add</button></div><div class="sl-chips">'+dsC+'</div></div>'}
-function addHL(){var i=document.getElementById("hl-input");if(!i)return;var v=i.value.trim();if(!v)return;if(state.healthLeave.indexOf(v)===-1)state.healthLeave.push(v);saveStudentLists();render()}
-function removeHL(i){state.healthLeave.splice(i,1);saveStudentLists();render()}
-function addDS(){var i=document.getElementById("ds-input");if(!i)return;var v=i.value.trim();if(!v)return;if(state.dailySick.indexOf(v)===-1)state.dailySick.push(v);saveStudentLists();render()}
-function removeDS(i){state.dailySick.splice(i,1);saveStudentLists();render()}
+function updateDateSelection(){
+  var sel=state.selectedDate;
+  if(sel===lastDateBarSelection)return;
+  lastDateBarSelection=sel;
+  var today=getTodayStr();
+  var btns=document.getElementById("date-bar").querySelectorAll(".date-btn");
+  btns.forEach(function(btn){
+    var d=btn.getAttribute("data-date");
+    btn.classList.remove("selected");
+    if(d===sel)btn.classList.add("selected");
+  });
+  var note=document.getElementById("date-note");
+  if(isPractice()){note.className="date-past-note practice-note";note.textContent="Testing mode — showing live data from your Google Sheet for today ("+fmtLabel(today)+"). Submit test responses to your form and click Refresh to see them here."}
+  else if(sel!==today&&sel<today){note.className="date-past-note hist";note.textContent="Viewing "+fmtLabel(sel)+" — historical data"}
+  else if(sel!==today&&sel>today){note.className="date-past-note hist";note.textContent="Viewing "+fmtLabel(sel)+" — upcoming, no submissions yet"}
+  else{note.className="date-past-note";note.textContent=""}
+}
 
-function render(){
+function renderStudentLists(){var c=document.getElementById("student-lists");if(!state.listsVisible){c.innerHTML='<button class="sl-toggle" onclick="state.listsVisible=true;renderStudentLists();">Show student health leave &amp; daily sick lists ▾</button>';return}var hlC=state.healthLeave.length>0?state.healthLeave.map(function(n,i){return'<span class="sl-chip health">'+esc(n)+' <span class="sl-chip-x" onclick="removeHL('+i+')">×</span></span>'}).join(""):'<span class="sl-empty">No students on health leave</span>';var dsC=state.dailySick.length>0?state.dailySick.map(function(n,i){return'<span class="sl-chip sick">'+esc(n)+' <span class="sl-chip-x" onclick="removeDS('+i+')">×</span></span>'}).join(""):'<span class="sl-empty">No students on today\'s sick list</span>';c.innerHTML='<div class="student-list-box health"><div class="sl-header"><span class="sl-title health">🏥 Health Leave</span><button class="sl-toggle" onclick="state.listsVisible=false;renderStudentLists();">Hide ▴</button></div><div class="sl-desc">Names <strong>suppressed</strong> from absent displays. Persists across days.</div><div class="sl-input-row"><input type="text" id="hl-input" placeholder="Student name…" onkeydown="if(event.key===\'Enter\')addHL()"><button class="sl-add-btn" onclick="addHL()">+ Add</button></div><div class="sl-chips">'+hlC+'</div></div><div class="student-list-box sick"><div class="sl-header"><span class="sl-title sick">🤒 Daily Sick List</span></div><div class="sl-desc">Reference only — names still show as absent, cards annotated. <strong>Persists until end of day</strong>, then auto-clears.</div><div class="sl-input-row"><input type="text" id="ds-input" placeholder="Student name…" onkeydown="if(event.key===\'Enter\')addDS()"><button class="sl-add-btn" onclick="addDS()">+ Add</button></div><div class="sl-chips">'+dsC+'</div></div>'}
+function addHL(){var i=document.getElementById("hl-input");if(!i)return;var v=i.value.trim();if(!v)return;if(state.healthLeave.indexOf(v)===-1)state.healthLeave.push(v);saveStudentLists();renderStudentLists();renderContent()}
+function removeHL(i){state.healthLeave.splice(i,1);saveStudentLists();renderStudentLists();renderContent()}
+function addDS(){var i=document.getElementById("ds-input");if(!i)return;var v=i.value.trim();if(!v)return;if(state.dailySick.indexOf(v)===-1)state.dailySick.push(v);saveStudentLists();renderStudentLists();renderContent()}
+function removeDS(i){state.dailySick.splice(i,1);saveStudentLists();renderStudentLists();renderContent()}
+
+// ============================================================
+// RENDER — split into renderContent (fast, frequent) and full render
+// ============================================================
+function renderContent(){
   var subs=state.allSubmissions[state.activePeriod]||{};var grace=isInGracePeriod();var viewing=isToday()||isPractice();
   var activeT=TEACHERS.filter(function(t){return t.periods[state.activePeriod]}).sort(function(a,b){return getLN(a.name).localeCompare(getLN(b.name))});
   var filtered=activeT;
@@ -191,27 +220,38 @@ function render(){
   else if(state.filterMode==="missing"){filtered=filtered.filter(function(t){return!subs[t.name]&&!state.manualOverrides[t.name]})}
   var total=activeT.length;var subCnt=activeT.filter(function(t){return subs[t.name]||state.manualOverrides[t.name]}).length;var missCnt=total-subCnt;var pct=total>0?(subCnt/total)*100:0;
 
+  // Header controls — lightweight updates
   document.getElementById("live-dot").className="live-dot "+(state.isLive&&viewing?"active":"paused");
   document.getElementById("live-label").textContent=state.isLive&&viewing?"LIVE":(isPractice()?"TESTING":"PAUSED");
   document.getElementById("live-label").style.color=state.isLive&&viewing?"var(--lss-green)":(isPractice()?"var(--lss-green)":"var(--lss-orange)");
-  document.getElementById("clock").textContent=new Date().toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"});
   var lb=document.getElementById("btn-live");lb.className="btn btn-live"+(state.isLive&&viewing?"":" paused");lb.textContent=state.isLive&&viewing?"● Live":"◯ Paused";
   var sb=document.getElementById("btn-sound");sb.className="btn btn-sound"+(state.soundEnabled?" active":"");sb.textContent=state.soundEnabled?"🔔 Sound ON":"🔕 Sound";
-  renderDateBar();
+
+  // Date bar — just update selection, don't rebuild
+  updateDateSelection();
+
+  // Period buttons — update counts and active state
   PERIOD_TIMES.forEach(function(p){var btn=document.getElementById("period-"+p.period);var pc=TEACHERS.filter(function(t){return t.periods[p.period]}).length;var ps=state.allSubmissions[p.period]||{};var pa=TEACHERS.filter(function(t){return t.periods[p.period]});var psc=pa.filter(function(t){return!!ps[t.name]}).length;btn.className="period-btn "+(state.activePeriod===p.period?"active":"");btn.innerHTML='<div class="label">'+p.label+' <span style="font-size:11px;font-weight:600;opacity:.6">('+psc+'/'+pc+')</span></div><div class="meta">'+fmtAMPM(p.start)+' – '+fmtAMPM(p.end)+'</div>'});
+
+  // Stats
   document.getElementById("stat-submitted").innerHTML=subCnt+'<span>/'+total+'</span>';
   if(missCnt>0){document.getElementById("stat-missing-container").style.display="block";document.getElementById("stat-all-good").style.display="none";var mn=document.getElementById("stat-missing");mn.textContent=missCnt;mn.className="stat-big stat-missing"+(grace?" grace":(missCnt<=3?" low":""))}else{document.getElementById("stat-missing-container").style.display="none";document.getElementById("stat-all-good").style.display="block"}
   document.getElementById("filter-all").className="filter-btn"+(state.filterMode==="all"?" active":"");
   document.getElementById("filter-submitted").className="filter-btn"+(state.filterMode==="submitted"?" submitted-active":"");
   document.getElementById("filter-missing").className="filter-btn"+(state.filterMode==="missing"?" missing-active":"");
   var pf=document.getElementById("progress-fill");pf.style.width=pct+"%";pf.className="progress-fill "+(pct>=100?"complete":"in-progress");
+
+  // Banners
   var eb=document.getElementById("error-banner");if(state.lastFetchError){eb.textContent="⚠ Fetch error: "+state.lastFetchError;eb.className="banner error visible"}else{eb.className="banner error"}
   document.getElementById("demo-banner").className="banner demo"+(!APPS_SCRIPT_URL?" visible":"");
-  renderStudentLists();
+
+  // Teacher grid — this is the big innerHTML, but only this section
   var grid=document.getElementById("teacher-grid");
   if(filtered.length===0){grid.innerHTML='<div class="empty-state" style="grid-column:1/-1">'+(state.filterMode==="missing"?"🎉 No missing submissions!":(state.filterMode==="submitted"?"No submissions yet for this period.":"No teachers match this filter."))+'</div>'}
   else if(state.filterMode==="all"){var miss=filtered.filter(function(t){return!subs[t.name]&&!state.manualOverrides[t.name]});var subm=filtered.filter(function(t){return subs[t.name]||state.manualOverrides[t.name]});var html="";if(miss.length>0&&subm.length>0)html+='<div class="section-label">'+(grace?'⏳ Grace period — waiting (':'⏳ Awaiting submission (')+miss.length+')</div>';html+=miss.map(function(t){return rCard(t,subs,grace)}).join("");if(subm.length>0&&miss.length>0)html+='<div class="section-label">✓ Submitted ('+subm.length+')</div>';html+=subm.map(function(t){return rCard(t,subs,false)}).join("");grid.innerHTML=html}
   else{grid.innerHTML=filtered.map(function(t){return rCard(t,subs,state.filterMode==="missing"&&grace)}).join("")}
+
+  // Runner box
   var rb=document.getElementById("runner-box");var am=activeT.filter(function(t){return!subs[t.name]&&!state.manualOverrides[t.name]});
   if(missCnt>0&&state.filterMode!=="submitted"&&!grace&&viewing){rb.style.display="block";document.getElementById("runner-chips").innerHTML=am.map(function(t){var rm=getRoom(t,state.activePeriod);var b=getBK(rm);return'<div class="runner-chip" onclick="toggleOverride(\''+t.name.replace(/'/g,"\\'")+'\')">'+'<span class="room '+b+'">'+rm+'</span><span class="last-name">'+getLN(t.name)+'</span></div>'}).join("")}else{rb.style.display="none"}
 }
@@ -228,18 +268,18 @@ function closeReport(){document.getElementById("report-overlay").className="repo
 function dlCSV(){var d=window._rpt;if(!d)return;var l=["Lawrenceville Summer Scholars — Daily Attendance Report",d.dl,"","PERIOD BREAKDOWN","Period,Total,Submitted,Missing Count,Missing Teachers"];d.ps.forEach(function(p){l.push(p.label+","+p.total+","+p.submitted+","+p.missing+",\""+p.missingNames.join("; ")+"\"")});l.push("","ABSENT STUDENTS","Student Name,Periods Absent");d.aList.forEach(function(a){l.push("\""+a.name+"\","+a.count)});if(d.hl.length>0){l.push("","HEALTH LEAVE (excluded)");d.hl.forEach(function(n){l.push("\""+n+"\"")})}var blob=new Blob([l.join("\n")],{type:"text/csv"});var url=URL.createObjectURL(blob);var a=document.createElement("a");a.href=url;a.download="attendance_report_"+state.selectedDate+".csv";document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url)}
 function printRpt(){var c=document.getElementById("report-content").innerHTML;var w=window.open("","_blank");w.document.write('<html><head><title>Attendance Report</title><link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet"><style>body{font-family:"Nunito",sans-serif;padding:40px;color:#2D2A26;max-width:800px;margin:0 auto}.report-title{font-size:22px;font-weight:800;color:#E8712A;margin-bottom:4px}.report-date{font-size:14px;color:#6B655C;margin-bottom:20px}.report-section{margin-bottom:20px}.report-section-title{font-size:14px;font-weight:800;margin-bottom:8px;text-transform:uppercase}.report-stat-row{display:flex;gap:16px;margin-bottom:16px}.report-stat{border:1px solid #E8E4DD;border-radius:8px;padding:12px 18px;flex:1}.report-stat .num{font-size:22px;font-weight:800}.report-stat .lbl{font-size:11px;color:#A49E94;text-transform:uppercase;margin-top:3px}.report-table{width:100%;border-collapse:collapse;font-size:13px}.report-table th{text-align:left;font-size:11px;text-transform:uppercase;padding:6px 10px;border-bottom:2px solid #E8E4DD;color:#A49E94}.report-table td{padding:8px 10px;border-bottom:1px solid #F0EDE8}.report-dl-row{display:none}</style></head><body>'+c+'</body></html>');w.document.close();w.onload=function(){w.print()}}
 
-function toggleOverride(name){if(state.manualOverrides[name])delete state.manualOverrides[name];else state.manualOverrides[name]=true;render()}
-function selectDate(d){state.selectedDate=d;state.allSubmissions={1:{},2:{},3:{},4:{}};state.manualOverrides={};state.previousMissingCount=null;if(isToday()||isPractice()){state.isLive=true}else{state.isLive=false}fetchAllPeriods();startRefreshTimer()}
-function setPeriod(p){state.activePeriod=p;state.manualOverrides={};render()}
-function toggleLive(){state.isLive=!state.isLive;if(state.isLive&&!isPractice()){state.selectedDate=getTodayStr();autoDetect()}fetchAllPeriods();startRefreshTimer();render()}
-function toggleSound(){state.soundEnabled=!state.soundEnabled;render()}
-function setFilter(m){state.filterMode=m;render()}
+function toggleOverride(name){if(state.manualOverrides[name])delete state.manualOverrides[name];else state.manualOverrides[name]=true;renderContent()}
+function selectDate(d){state.selectedDate=d;state.manualOverrides={};state.previousMissingCount=null;if(isToday()||isPractice()){state.isLive=true}else{state.isLive=false}fetchAllPeriods();startRefreshTimer()}
+function setPeriod(p){state.activePeriod=p;state.manualOverrides={};renderContent()}
+function toggleLive(){state.isLive=!state.isLive;if(state.isLive&&!isPractice()){state.selectedDate=getTodayStr();autoDetect()}fetchAllPeriods();startRefreshTimer();renderContent()}
+function toggleSound(){state.soundEnabled=!state.soundEnabled;renderContent()}
+function setFilter(m){state.filterMode=m;renderContent()}
 function doRefresh(){fetchAllPeriods()}
 function autoDetect(){if(!isToday()&&!isPractice())return;var now=new Date();var t=now.getHours()*60+now.getMinutes();for(var i=0;i<PERIOD_TIMES.length;i++){var p=PERIOD_TIMES[i];var sp=p.start.split(":");var ep=p.end.split(":");if(t>=+sp[0]*60+ +sp[1]&&t<=+ep[0]*60+ +ep[1]){state.activePeriod=p.period;return}}}
-function checkMidnight(){var today=getTodayStr();if(isToday()&&state.selectedDate!==today){state.selectedDate=today;state.allSubmissions={1:{},2:{},3:{},4:{}};state.manualOverrides={};state.previousMissingCount=null;loadStudentLists();fetchAllPeriods()}}
+function checkMidnight(){var today=getTodayStr();if(isToday()&&state.selectedDate!==today){state.selectedDate=today;state.allSubmissions={1:{},2:{},3:{},4:{}};state.manualOverrides={};state.previousMissingCount=null;delete dataCache[state.selectedDate];loadStudentLists();buildDateBar();fetchAllPeriods()}}
 function startRefreshTimer(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(function(){if(!state.isLive)return;checkMidnight();autoDetect();fetchAllPeriods()},REFRESH_INTERVAL_MS)}
 setInterval(function(){document.getElementById("clock").textContent=new Date().toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"})},10000);
-window.addEventListener("DOMContentLoaded",function(){if(LOGO_URL){document.getElementById("header-logo").src=LOGO_URL;document.getElementById("header-logo").style.display="block"}loadStudentLists();autoDetect();fetchAllPeriods();startRefreshTimer();startGraceTimer()});
+window.addEventListener("DOMContentLoaded",function(){if(LOGO_URL){document.getElementById("header-logo").src=LOGO_URL;document.getElementById("header-logo").style.display="block"}loadStudentLists();buildDateBar();renderStudentLists();autoDetect();fetchAllPeriods();startRefreshTimer();startGraceTimer()});
 </script>
 
 <div class="header"><div class="header-left"><img class="logo" id="header-logo" src="" alt="" style="display:none"><div><div class="header-title">Lawrenceville Summer Scholars</div><div class="header-subtitle">Attendance Tracker · 2026</div></div><div class="live-indicator" style="margin-left:8px"><div class="live-dot active" id="live-dot"></div><span id="live-label" style="color:var(--lss-green)">LIVE</span></div></div><div class="header-right"><div class="clock" id="clock">--:--</div><button class="btn btn-sound" id="btn-sound" onclick="toggleSound()">🔕 Sound</button><button class="btn btn-live" id="btn-live" onclick="toggleLive()">● Live</button><button class="btn btn-refresh" onclick="doRefresh()">↻ Refresh</button><button class="btn btn-report" onclick="generateReport()">📊 Report</button></div></div>
